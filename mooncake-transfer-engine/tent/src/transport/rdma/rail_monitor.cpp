@@ -17,11 +17,12 @@
 namespace mooncake {
 namespace tent {
 
-Status RailMonitor::load(const Topology* local, const Topology* remote,
+Status RailMonitor::load(std::shared_ptr<const Topology> local,
+                         std::shared_ptr<const Topology> remote,
                          const std::string& rail_topo_json,
                          const Config* conf) {
-    local_ = local;
-    remote_ = remote;
+    local_ = std::move(local);
+    remote_ = std::move(remote);
     if (conf) {
         error_threshold_ = conf->get(kCfgErrorThreshold, error_threshold_);
         error_window_ = std::chrono::seconds(
