@@ -395,9 +395,10 @@ class Workers {
         // so parked entries can never starve behind contending producers.
         std::vector<std::pair<int, RdmaSliceList>> requeue_overflow;
 
-        // Shared ownership keeps the monitor alive while a slice is retained
-        // by an endpoint through delayed teardown.
-        std::unordered_map<std::string, std::shared_ptr<RailMonitor>> rails;
+        // Values are held via unique_ptr so that map rehashing does not
+        // invalidate pointers into RailMonitor stored on in-flight slices
+        // (see RdmaSlice::rail_monitor).
+        std::unordered_map<std::string, std::unique_ptr<RailMonitor>> rails;
         PerfMetricSummary perf;
         uint64_t padding[15];
     };

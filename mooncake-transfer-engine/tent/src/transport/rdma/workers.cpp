@@ -737,11 +737,16 @@ void Workers::asyncPostSend() {
     auto& overflow = worker.requeue_overflow;
     for (int prio = PRIO_HIGH; prio < kNumPriorityLevels; ++prio) {
         if (shared_quota && !shared_quota->canSend(prio)) continue;
+<<<<<<< HEAD
         for (auto it = overflow.begin();
              it != overflow.end() &&
              (deadline_bw_arbitration_ || new_slices < slice_budget);) {
             if (it->first == prio) {
                 new_slices += it->second.num_slices;
+=======
+        for (auto it = overflow.begin(); it != overflow.end();) {
+            if (it->first == prio) {
+>>>>>>> 56ed530a ([TENT] Keep the worker from blocking on its own submit queue (#3683))
                 result.push_back(it->second);
                 it = overflow.erase(it);
             } else {
@@ -749,6 +754,7 @@ void Workers::asyncPostSend() {
             }
         }
         if (!result.empty()) break;
+<<<<<<< HEAD
         if (deadline_bw_arbitration_) {
             worker.queues[prio].pop(result);
         } else {
@@ -761,6 +767,9 @@ void Workers::asyncPostSend() {
                 result.push_back(list);
             }
         }
+=======
+        worker.queues[prio].pop(result);
+>>>>>>> 56ed530a ([TENT] Keep the worker from blocking on its own submit queue (#3683))
         if (!result.empty()) break;
     }
 
@@ -860,6 +869,7 @@ void Workers::asyncPostSend() {
                     submitFromTick(worker, slice);
 =======
                     releaseSliceQuota(slice);
+<<<<<<< HEAD
                     // The worker must never block on enqueue: if the queue is
                     // full, fail the slice immediately rather than spinning.
                     // Spinning here wedges the worker (it stops popping its own
@@ -873,6 +883,9 @@ void Workers::asyncPostSend() {
                         updateSliceStatus(slice, FAILED);
                     }
 >>>>>>> 73060737 ([Bugfix][TENT] Add non-blocking try_push to BoundedMPSCQueue and fail slices on queue full (#3636))
+=======
+                    submitFromTick(worker, slice);
+>>>>>>> 56ed530a ([TENT] Keep the worker from blocking on its own submit queue (#3683))
                 }
             }
             continue;
@@ -964,6 +977,7 @@ void Workers::asyncPostSend() {
                     disableEndpoint(slice);
                     updateSliceStatus(slice, FAILED);
                 } else {
+<<<<<<< HEAD
                     // Non-blocking re-enqueue: never wedge the worker on a
                     // full queue. Fail the slice instead. See #3636/#3637.
                     Status st = submit(slice);
@@ -974,6 +988,9 @@ void Workers::asyncPostSend() {
                             << st.message() << ")";
                         updateSliceStatus(slice, FAILED);
                     }
+=======
+                    submitFromTick(worker, slice);
+>>>>>>> 56ed530a ([TENT] Keep the worker from blocking on its own submit queue (#3683))
                 }
                 worker.inflight_slices.fetch_sub(1);
 >>>>>>> d96993a ([Bugfix][TENT] Add non-blocking try_push to BoundedMPSCQueue and fail slices on queue full (#3636))
@@ -1013,6 +1030,20 @@ void Workers::promoteTimedOutRequests(WorkerContext& worker) {
         auto requeue = [&](int target, RdmaSliceList& slice_list) {
             if (!worker.queues[target].try_push(slice_list)) {
                 worker.requeue_overflow.emplace_back(target, slice_list);
+<<<<<<< HEAD
+=======
+            }
+        };
+
+        if (!priority_promotion_per_entry_) {
+            auto* slice = drained.front().first;
+            const bool head_timed_out = slice && slice->enqueue_ts > 0 &&
+                                        current_ts >= slice->enqueue_ts &&
+                                        (current_ts - slice->enqueue_ts) >=
+                                            priority_promotion_timeout_ns_;
+            for (auto& slice_list : drained) {
+                requeue(head_timed_out ? to : from, slice_list);
+>>>>>>> 56ed530a ([TENT] Keep the worker from blocking on its own submit queue (#3683))
             }
         };
 
@@ -1465,6 +1496,7 @@ void Workers::asyncPollCq() {
                             std::memory_order_acquire)) {
                         updateSliceStatus(slice, CANCELED);
                     } else {
+<<<<<<< HEAD
                         // Non-blocking re-enqueue: never wedge the worker on a
                         // full queue. Fail the slice instead. See #3636/#3637.
                         Status st = submit(slice);
@@ -1475,6 +1507,9 @@ void Workers::asyncPollCq() {
                                 << st.message() << ")";
                             updateSliceStatus(slice, FAILED);
                         }
+=======
+                        submitFromTick(worker, slice);
+>>>>>>> 56ed530a ([TENT] Keep the worker from blocking on its own submit queue (#3683))
                     }
                 }
             } else {
