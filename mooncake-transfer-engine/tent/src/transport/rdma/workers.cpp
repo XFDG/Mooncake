@@ -41,19 +41,9 @@ namespace tent {
 thread_local int tl_wid = -1;
 
 namespace {
-// Look up (or create) the RailMonitor for `machine_id` on this worker's map.
-// Return shared ownership so slices retained through endpoint teardown keep
-// the monitor alive after the worker context is released.
-std::shared_ptr<RailMonitor> getOrCreateRail(
-    std::unordered_map<std::string, std::shared_ptr<RailMonitor>>& rails,
-    const std::string& machine_id) {
-    auto it = rails.find(machine_id);
-    if (it != rails.end()) return it->second;
-    auto rail = std::make_shared<RailMonitor>();
-    rails.emplace(machine_id, rail);
-    return rail;
-}
-
+// Look up (or create) the RailMonitor for `machine_id` on this worker's
+// map. Returning a stable reference is safe because the map stores values
+// via unique_ptr -- rehashes move the pointer slot, not the RailMonitor.
 RailMonitor& getOrCreateRail(
     std::unordered_map<std::string, std::unique_ptr<RailMonitor>>& rails,
     const std::string& machine_id) {
@@ -61,15 +51,6 @@ RailMonitor& getOrCreateRail(
     if (it != rails.end()) return *it->second;
     auto [ins, _] = rails.emplace(machine_id, std::make_unique<RailMonitor>());
     return *ins->second;
-}
-
-void cancelSliceProbe(RdmaSlice* slice) {
-    if (!slice) return;
-    const auto token =
-        slice->rail_probe_token.exchange(0, std::memory_order_acq_rel);
-    auto rail = slice->rail_monitor;
-    if (rail && token != 0)
-        rail->cancelProbe(slice->source_dev_id, slice->target_dev_id, token);
 }
 }  // namespace
 
@@ -109,10 +90,9 @@ Workers::Workers(RdmaTransport* transport)
     // Core Scheduling Configuration
     // ============================================================
 
-    // Keep smart scheduling opt-in while platform-specific scheduling issues
-    // are investigated (false = simple round-robin).
+    // Enable/disable smart scheduling (false = simple round-robin)
     bool enable_smart_scheduling =
-        conf->get("transports/rdma/enable_smart_scheduling", false);
+        conf->get("transports/rdma/enable_smart_scheduling", true);
     device_selector_->setSmartSelection(enable_smart_scheduling);
 
     // ============================================================
@@ -132,12 +112,6 @@ Workers::Workers(RdmaTransport* transport)
 
     params.strict_local_numa =
         conf->get("transports/rdma/strict_local_numa", false);
-    dest_device_affinity_ =
-        conf->get("transports/rdma/dest_device_affinity", false);
-    if (dest_device_affinity_) {
-        LOG(INFO) << "RDMA dest device affinity enabled: remote NIC follows "
-                     "the same-name direct rail";
-    }
 
     // ============================================================
     // Bandwidth Estimation (EWMA)
@@ -366,36 +340,101 @@ Status Workers::submit(RdmaSliceList& slice_list, int worker_id) {
     }
     auto& worker = worker_context_[worker_id];
 
-    // This lane's set and counter now account for the slices, wherever they
-    // are later swept from. First entry only: a slice arriving here has
-    // never been counted, so there is nothing to move.
-    auto* owned = slice_list.first;
-    for (int i = 0; i < slice_list.num_slices && owned; ++i) {
-        owned->owner_worker.store(worker_id, std::memory_order_relaxed);
-        owned->counted_lane.store(worker_id, std::memory_order_relaxed);
-        owned = owned->next;
-    }
-
     // Get priority from first slice (all slices in list have same priority)
     int priority = PRIO_HIGH;
     if (slice_list.first && slice_list.first->task) {
         priority = slice_list.first->priority;
     }
 
-    // A worker may finish immediately after queue publication.
-    // Use try_push to avoid blocking when queue is full. If the queue is full,
-    // return an error so the caller can fail the slice immediately instead of
-    // spinning indefinitely. This prevents livelock when the worker thread
-    // itself tries to re-enqueue retried slices into a full queue.
-    if (!worker.queues[priority].try_push(slice_list)) {
-        LOG(WARNING) << "Worker " << worker_id << " queue full (capacity "
-                     << Workers::kCapacity << "), rejecting slice";
-        return Status(Status::Code::kTooManyRequests,
-                      "Worker submit queue is full, cannot accept more slices");
+    BoundedSliceQueue::Reservation reservation;
+    if (!worker.queues[priority].try_reserve(reservation)) {
+        return Status::TooManyRequests("Worker submit queue is full" LOC_MARK);
     }
-    const auto previous =
-        worker.inflight_slices.fetch_add(slice_list.num_slices);
-    if (!previous) {
+
+    // Account for the list before publishing it to the consumer.
+    auto* owned = slice_list.first;
+    for (int i = 0; i < slice_list.num_slices && owned; ++i) {
+        owned->owner_worker.store(worker_id, std::memory_order_relaxed);
+        owned->counted_lane.store(worker_id, std::memory_order_relaxed);
+        owned = owned->next;
+    }
+    bool wake = !worker.inflight_slices.fetch_add(slice_list.num_slices);
+    worker.queues[priority].commit(reservation, slice_list);
+    if (wake) {
+        std::lock_guard<std::mutex> lock(worker.mutex);
+        if (worker.in_suspend) worker.cv.notify_all();
+    }
+    return Status::OK();
+}
+
+Status Workers::admitBatch(std::vector<RdmaSliceList>& slice_lists) {
+    if (!accepting_submits_.load(std::memory_order_acquire)) {
+        return Status::InternalError("RDMA transport is quiescing" LOC_MARK);
+    }
+    if (!running_.load(std::memory_order_acquire) || !worker_context_ ||
+        num_workers_ == 0) {
+        return Status::InternalError("RDMA workers are not running" LOC_MARK);
+    }
+    if (slice_lists.size() > num_workers_) {
+        return Status::InvalidArgument("Too many worker slice lists" LOC_MARK);
+    }
+
+    struct PendingAdmission {
+        int worker_id;
+        int priority;
+        RdmaSliceList* slice_list;
+        BoundedSliceQueue::Reservation reservation;
+        bool wake = false;
+    };
+    std::vector<PendingAdmission> pending;
+    pending.reserve(slice_lists.size());
+
+    for (size_t i = 0; i < slice_lists.size(); ++i) {
+        auto& slice_list = slice_lists[i];
+        if (!slice_list.first || slice_list.num_slices == 0) continue;
+        int priority = slice_list.first->priority;
+        PendingAdmission admission{
+            static_cast<int>(i), priority, &slice_list, {}};
+        auto& queue = worker_context_[i].queues[priority];
+        if (!queue.try_reserve(admission.reservation)) {
+            for (auto& reserved : pending) {
+                auto& worker = worker_context_[reserved.worker_id];
+                worker.queues[reserved.priority].cancel_reservation(
+                    reserved.reservation);
+                // Empty reservations do not count as inflight slices, but an
+                // idle consumer must wake to drain them and return queue slots.
+                std::lock_guard<std::mutex> lock(worker.mutex);
+                if (worker.in_suspend) worker.cv.notify_all();
+            }
+            return Status::TooManyRequests(
+                "Worker submit queue is full; batch was not "
+                "published" LOC_MARK);
+        }
+        pending.push_back(admission);
+    }
+
+    // All queues have room. Establish ownership and accounting before any
+    // consumer can observe a real list.
+    for (auto& admission : pending) {
+        auto& worker = worker_context_[admission.worker_id];
+        auto* owned = admission.slice_list->first;
+        for (int i = 0; i < admission.slice_list->num_slices && owned; ++i) {
+            owned->owner_worker.store(admission.worker_id,
+                                      std::memory_order_relaxed);
+            owned->counted_lane.store(admission.worker_id,
+                                      std::memory_order_relaxed);
+            owned = owned->next;
+        }
+        admission.wake =
+            !worker.inflight_slices.fetch_add(admission.slice_list->num_slices);
+    }
+    for (auto& admission : pending) {
+        worker_context_[admission.worker_id].queues[admission.priority].commit(
+            admission.reservation, *admission.slice_list);
+    }
+    for (auto& admission : pending) {
+        if (!admission.wake) continue;
+        auto& worker = worker_context_[admission.worker_id];
         std::lock_guard<std::mutex> lock(worker.mutex);
         if (worker.in_suspend) worker.cv.notify_all();
     }
@@ -707,11 +746,8 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
 }
 
 void Workers::disableEndpoint(RdmaSlice* slice) {
-    const auto probe_token =
-        slice->rail_probe_token.exchange(0, std::memory_order_acq_rel);
-    if (auto rail = slice->rail_monitor) {
-        rail->markFailed(slice->source_dev_id, slice->target_dev_id,
-                         probe_token);
+    if (auto* rail = slice->rail_monitor) {
+        rail->markFailed(slice->source_dev_id, slice->target_dev_id);
     }
     if (auto ep = slice->ep_weak_ptr.lock()) {
         ep->acknowledge(slice, FAILED);
@@ -722,8 +758,6 @@ void Workers::disableEndpoint(RdmaSlice* slice) {
 void Workers::asyncPostSend() {
     auto& worker = worker_context_[tl_wid];
     std::vector<RdmaSliceList> result;
-    const size_t slice_budget = transport_->params_->endpoint.max_qp_wr;
-    size_t new_slices = 0;
 
     auto shared_quota =
         device_selector_ ? device_selector_->getSharedSlotManager() : nullptr;
@@ -736,17 +770,12 @@ void Workers::asyncPostSend() {
     // behind producers that keep refilling freed slots (issue #3637).
     auto& overflow = worker.requeue_overflow;
     for (int prio = PRIO_HIGH; prio < kNumPriorityLevels; ++prio) {
+        // Return canceled reservation slots even when this priority cannot
+        // send. Real entries and the local overflow remain quota-controlled.
+        worker.queues[prio].discard_empty_entries();
         if (shared_quota && !shared_quota->canSend(prio)) continue;
-<<<<<<< HEAD
-        for (auto it = overflow.begin();
-             it != overflow.end() &&
-             (deadline_bw_arbitration_ || new_slices < slice_budget);) {
-            if (it->first == prio) {
-                new_slices += it->second.num_slices;
-=======
         for (auto it = overflow.begin(); it != overflow.end();) {
             if (it->first == prio) {
->>>>>>> 56ed530a ([TENT] Keep the worker from blocking on its own submit queue (#3683))
                 result.push_back(it->second);
                 it = overflow.erase(it);
             } else {
@@ -754,22 +783,7 @@ void Workers::asyncPostSend() {
             }
         }
         if (!result.empty()) break;
-<<<<<<< HEAD
-        if (deadline_bw_arbitration_) {
-            worker.queues[prio].pop(result);
-        } else {
-            // Prepare one QP window, then post and return to CQ polling. Do
-            // not wait for a full window when the producer has less ready.
-            while (new_slices < slice_budget) {
-                auto list = worker.queues[prio].pop();
-                if (!list.num_slices) break;
-                new_slices += list.num_slices;
-                result.push_back(list);
-            }
-        }
-=======
         worker.queues[prio].pop(result);
->>>>>>> 56ed530a ([TENT] Keep the worker from blocking on its own submit queue (#3683))
         if (!result.empty()) break;
     }
 
@@ -783,27 +797,15 @@ void Workers::asyncPostSend() {
             }
             auto status = generatePostPath(slice);
             if (!status.ok()) {
-                VLOG(1) << "Failed to generate post path for slice " << slice
-                        << ": " << status.ToString();
-                LOG_EVERY_N(ERROR, 10000)
-                    << "Failed to generate post path for slice " << slice
-                    << ": " << status.ToString();
-                // generatePostPath may have armed a probe/trial via admit()
-                // before a later validation failed (e.g. rkey out of bounds).
-                // The slice never reaches the wire, so roll back the admission
-                // or the rail is permanently blocked (Half-Open).
-                cancelSliceProbe(slice);
+                LOG(ERROR) << "Failed to generate post path for slice " << slice
+                           << ": " << status.ToString();
                 releaseSliceQuota(slice, getCurrentTimeInNano());
-                // Count first: resolving the slice lets the batch be freed.
-                discountFromOwner(worker, slice);
                 updateSliceStatus(slice, slice->task->cancel_requested.load(
                                              std::memory_order_acquire)
                                              ? CANCELED
                                              : FAILED);
+                discountFromOwner(worker, slice);
             } else if (dropUnpostableSlice(worker, slice)) {
-                // Path generated OK (admit may have armed a probe), then the
-                // slice was canceled before posting: roll back the admission.
-                cancelSliceProbe(slice);
                 slice = slice->next;
                 continue;
             } else {
@@ -823,14 +825,8 @@ void Workers::asyncPostSend() {
         if (slices.empty()) continue;
         slices.erase(std::remove_if(slices.begin(), slices.end(),
                                     [&](RdmaSlice* slice) {
-                                        if (!dropUnpostableSlice(worker, slice))
-                                            return false;
-                                        // Canceled after admit() armed a
-                                        // probe/trial but before the endpoint
-                                        // was obtained: roll back the
-                                        // admission.
-                                        cancelSliceProbe(slice);
-                                        return true;
+                                        return dropUnpostableSlice(worker,
+                                                                   slice);
                                     }),
                      slices.end());
         if (slices.empty()) continue;
@@ -839,53 +835,19 @@ void Workers::asyncPostSend() {
             std::vector<RdmaSlice*> clone;
             slices.swap(clone);
             for (auto slice : clone) {
-                if (dropUnpostableSlice(worker, slice)) {
-                    // Canceled after admit() armed a probe/trial: roll back.
-                    cancelSliceProbe(slice);
-                    continue;
-                }
+                if (dropUnpostableSlice(worker, slice)) continue;
                 slice->retry_count++;
                 releaseSliceQuota(slice, getCurrentTimeInNano());
                 if (slice->retry_count >=
                     transport_->params_->workers.max_retry_count) {
-                    VLOG(1)
+                    LOG(WARNING)
                         << "Slice " << slice << " failed: retry count exceeded";
-                    LOG_EVERY_N(WARNING, 100)
-                        << "Slice " << slice << " failed: retry count exceeded";
-                    // No endpoint was obtained, so the admitted probe/trial
-                    // never reached the wire. Roll back its ownership before
-                    // recording the terminal endpoint failure.
-                    cancelSliceProbe(slice);
                     disableEndpoint(slice);
-                    discountFromOwner(worker, slice);
                     updateSliceStatus(slice, FAILED);
+                    discountFromOwner(worker, slice);
                 } else {
-<<<<<<< HEAD
                     // The re-submit moves the count to the lane it lands on.
-                    // No endpoint was obtained, so this slice never reached the
-                    // wire on the rail admit() selected: clear any probe/trial
-                    // it armed so the rail is not stranded.
-                    cancelSliceProbe(slice);
                     submitFromTick(worker, slice);
-=======
-                    releaseSliceQuota(slice);
-<<<<<<< HEAD
-                    // The worker must never block on enqueue: if the queue is
-                    // full, fail the slice immediately rather than spinning.
-                    // Spinning here wedges the worker (it stops popping its own
-                    // queue) and livelocks the whole engine. See #3636/#3637.
-                    Status st = submit(slice);
-                    if (!st.ok()) {
-                        LOG(WARNING)
-                            << "Slice " << slice
-                            << " failed: re-enqueue rejected ("
-                            << st.message() << ")";
-                        updateSliceStatus(slice, FAILED);
-                    }
->>>>>>> 73060737 ([Bugfix][TENT] Add non-blocking try_push to BoundedMPSCQueue and fail slices on queue full (#3636))
-=======
-                    submitFromTick(worker, slice);
->>>>>>> 56ed530a ([TENT] Keep the worker from blocking on its own submit queue (#3683))
                 }
             }
             continue;
@@ -912,40 +874,16 @@ void Workers::asyncPostSend() {
         int num_submitted = endpoint->submitSlices(
             slices, tl_wid,
             [&](RdmaSlice* posted) { markPosted(worker, posted, post_ts); });
-        int first_failed = num_submitted;
-        for (int id = 0; id < num_submitted; ++id) {
-            if (slices[id]->failed) {
-                first_failed = id;
-                break;
-            }
-        }
-        // A partial post can leave an accepted prefix with no signaled tail.
-        // Retire this local QP so ERR flushes every accepted WR; this local
-        // posting failure must not be recorded as a failed rail.
-        if (first_failed > 0 && first_failed < num_submitted &&
-            !slices[first_failed - 1]->completion_signaled &&
-            path.local_device_id >= 0 &&
-            path.local_device_id <
-                static_cast<int>(transport_->context_set_.size())) {
-            auto* context =
-                transport_->context_set_[path.local_device_id].get();
-            if (context && context->endpointStore())
-                context->endpointStore()->remove(endpoint.get());
-        }
         for (int id = 0; id < num_submitted; ++id) {
             auto slice = slices[id];
-<<<<<<< HEAD
             if (!slice->failed) continue;
             // Rejected by the hardware: it never went on the wire, so take
             // back what the hook put in place.
             worker.inflight_slice_set.erase(slice);
             releaseSliceQuota(slice, post_ts);
             if (slice->task->cancel_requested.load(std::memory_order_acquire)) {
-                // Canceled after admit() armed a probe/trial and HW rejected
-                // the post: roll back the admission.
-                cancelSliceProbe(slice);
-                discountFromOwner(worker, slice);
                 updateSliceStatus(slice, CANCELED);
+                discountFromOwner(worker, slice);
                 continue;
             }
             slice->retry_count++;
@@ -953,52 +891,10 @@ void Workers::asyncPostSend() {
                 transport_->params_->workers.max_retry_count) {
                 LOG(WARNING)
                     << "Slice " << slice << " failed: retry count exceeded";
-                // This attempt never reached the wire, including its final
-                // retry, so it cannot complete the probe it admitted.
-                cancelSliceProbe(slice);
-                discountFromOwner(worker, slice);
-<<<<<<< HEAD
+                disableEndpoint(slice);
                 updateSliceStatus(slice, FAILED);
-=======
-=======
-            if (slice->failed) {
-                releaseSliceQuota(slice);
-                if (slice->task->cancel_requested.load(
-                        std::memory_order_acquire)) {
-                    updateSliceStatus(slice, CANCELED);
-                    worker.inflight_slices.fetch_sub(1);
-                    continue;
-                }
-                slice->retry_count++;
-                if (slice->retry_count >=
-                    transport_->params_->workers.max_retry_count) {
-                    LOG(WARNING)
-                        << "Slice " << slice << " failed: retry count exceeded";
-                    disableEndpoint(slice);
-                    updateSliceStatus(slice, FAILED);
-                } else {
-<<<<<<< HEAD
-                    // Non-blocking re-enqueue: never wedge the worker on a
-                    // full queue. Fail the slice instead. See #3636/#3637.
-                    Status st = submit(slice);
-                    if (!st.ok()) {
-                        LOG(WARNING)
-                            << "Slice " << slice
-                            << " failed: re-enqueue rejected ("
-                            << st.message() << ")";
-                        updateSliceStatus(slice, FAILED);
-                    }
-=======
-                    submitFromTick(worker, slice);
->>>>>>> 56ed530a ([TENT] Keep the worker from blocking on its own submit queue (#3683))
-                }
-                worker.inflight_slices.fetch_sub(1);
->>>>>>> d96993a ([Bugfix][TENT] Add non-blocking try_push to BoundedMPSCQueue and fail slices on queue full (#3636))
->>>>>>> 73060737 ([Bugfix][TENT] Add non-blocking try_push to BoundedMPSCQueue and fail slices on queue full (#3636))
+                discountFromOwner(worker, slice);
             } else {
-                // Rejected by hardware before reaching the wire: clear any
-                // probe/trial admit() armed on the selected rail.
-                cancelSliceProbe(slice);
                 submitFromTick(worker, slice);
             }
         }
@@ -1030,20 +926,6 @@ void Workers::promoteTimedOutRequests(WorkerContext& worker) {
         auto requeue = [&](int target, RdmaSliceList& slice_list) {
             if (!worker.queues[target].try_push(slice_list)) {
                 worker.requeue_overflow.emplace_back(target, slice_list);
-<<<<<<< HEAD
-=======
-            }
-        };
-
-        if (!priority_promotion_per_entry_) {
-            auto* slice = drained.front().first;
-            const bool head_timed_out = slice && slice->enqueue_ts > 0 &&
-                                        current_ts >= slice->enqueue_ts &&
-                                        (current_ts - slice->enqueue_ts) >=
-                                            priority_promotion_timeout_ns_;
-            for (auto& slice_list : drained) {
-                requeue(head_timed_out ? to : from, slice_list);
->>>>>>> 56ed530a ([TENT] Keep the worker from blocking on its own submit queue (#3683))
             }
         };
 
@@ -1118,32 +1000,18 @@ void Workers::expireTimedOutSlices(WorkerContext& worker, uint64_t now_ns) {
             auto ep = slice->ep_weak_ptr.lock();
             LOG(WARNING) << "Slice " << slice
                          << " failed: transfer timeout (software)";
-            // Resolve the task and return its selector charge now, but keep
-            // WR/CQ reservations until polling drains them. The QP's ERR
-            // transition can produce flush CQEs on a CQ shared by endpoints.
+            // The slice turns terminal here, not on the CQ. Its flush
+            // completion may never be polled (acknowledge() zeroes wr_depth,
+            // so the endpoint destroys the QP and its unpolled CQEs), so
+            // return the selector charge now for it and every slice swept
+            // with it; releaseSliceQuota() is idempotent.
             if (!ep) {
-                // The endpoint is already gone, so no CQE can arrive to release
-                // this slice's probe ownership.
-                cancelSliceProbe(slice);
                 retire(slice);
                 updateSliceStatus(slice, TIMEOUT);
                 continue;
             }
-            auto num_slices = ep->markPrefix(slice, TIMEOUT, retire);
-            if (num_slices > 0) {
-                bool retired = false;
-                if (slice->source_dev_id >= 0 &&
-                    slice->source_dev_id <
-                        static_cast<int>(transport_->context_set_.size())) {
-                    auto* context =
-                        transport_->context_set_[slice->source_dev_id].get();
-                    if (context && context->endpointStore()) {
-                        retired =
-                            context->endpointStore()->remove(ep.get()) == 0;
-                    }
-                }
-                if (!retired) ep->beginDestroy();
-            }
+            auto num_slices = ep->acknowledge(slice, TIMEOUT, retire);
+            disableEndpoint(slice);
             if (num_slices == 0) {
                 // A neighbour's retry already popped it off the queue pair
                 // and discounted it there, so only its charge and its set
@@ -1160,24 +1028,8 @@ void Workers::expireTimedOutSlices(WorkerContext& worker, uint64_t now_ns) {
 
 void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
                                const ibv_wc& wc, uint64_t poll_ts,
-                               bool last_in_pass, bool queue_already_drained,
-                               bool completion_owed) {
+                               bool last_in_pass) {
     auto slice = (RdmaSlice*)wc.wr_id;
-    // The completion this post owed, paid back only once this handler is
-    // done with the slice. Paying it on entry is not enough: acknowledge()
-    // further down publishes the terminal status the caller is waiting for,
-    // so the batch can be freed, and the slice with it, while the lines
-    // after it still read the slice. Above zero, freeSubBatch() hands the
-    // slice to the orphan list instead of the slab and the reaper leaves it
-    // there.
-    struct CompletionPaid {
-        RdmaSlice* slice;
-        bool owed;
-        ~CompletionPaid() {
-            if (owed)
-                slice->completions_owed.fetch_sub(1, std::memory_order_acq_rel);
-        }
-    } completion_paid{slice, completion_owed};
     // What the acknowledge callbacks below need, behind one reference so
     // the std::function stays in its small-buffer storage (no allocation
     // per completion).
@@ -1230,44 +1082,19 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
     }
     if (slice->word != PENDING) {
         // Resolved before its completion was polled -- swept off the queue
-        // pair by a neighbour, timed out, or cancelled by a teardown. A
-        // timeout leaves the WR queued so its flush CQE can release the WR
-        // and CQ reservations. A prefix already drained by asyncPollCq has
-        // already paid those reservations back.
-        // If this was the probe owner's late completion, release only its
-        // token; a stale/unrelated slice cannot clear another trial.
-        cancelSliceProbe(slice);
-        if (ep && !queue_already_drained) {
-            const auto retired =
-                ep->acknowledge(slice, slice->word, [&sweep](RdmaSlice* swept) {
-                    sweep.self->retireSweptSlice(*sweep.worker, swept,
-                                                 sweep.now_ns, nullptr);
-                });
-            if (retired == 0) discountFromOwner(worker, slice);
-        } else {
-            discountFromOwner(worker, slice);
-        }
+        // pair by a neighbour, timed out, or cancelled by a teardown. The
+        // charge came back above; the lane count is settled here in case
+        // that path could not (idempotent, so a path that did is unharmed).
+        discountFromOwner(worker, slice);
         return;
     }
     if (!ep) {
-        // The endpoint can disappear before its completion is polled. This
-        // slice cannot resolve its probe through normal endpoint handling.
-        cancelSliceProbe(slice);
         updateSliceStatus(slice, FAILED);
         discountFromOwner(worker, slice);
         return;
     }
     if (wc.status != IBV_WC_SUCCESS) {
-        const bool flush_error = wc.status == IBV_WC_WR_FLUSH_ERR;
-        auto handleEndpointError = [&] {
-            if (flush_error) {
-                cancelSliceProbe(slice);
-                ep->resetConnection("QP flush completion");
-            } else {
-                disableEndpoint(slice);
-            }
-        };
-        if (!flush_error) {
+        if (wc.status != IBV_WC_WR_FLUSH_ERR) {
             // TE handles them automatically
             LOG(INFO) << "Detected error WQE for slice " << slice
                       << " (opcode: " << slice->task->request.opcode
@@ -1289,13 +1116,13 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
         bool remote_gdr_err = (wc.status == IBV_WC_REM_ACCESS_ERR ||
                                wc.status == IBV_WC_REM_OP_ERR);
         if (local_gdr_err && slice->source_gpu_ordinal >= 0 &&
-            !slice->source_nic_name.empty()) {
+            slice->source_nic_name) {
             GdrReachability::instance().reportLocalFailure(
                 slice->source_nic_name, slice->source_gpu_ordinal);
         } else if (remote_gdr_err && slice->target_gpu_ordinal >= 0 &&
-                   !slice->target_nic_name.empty()) {
+                   slice->target_nic_name && slice->target_machine_id) {
             GdrReachability::instance().reportRemoteFailure(
-                slice->target_machine_id, slice->target_nic_name,
+                *slice->target_machine_id, slice->target_nic_name,
                 slice->target_gpu_ordinal);
         }
         slice->retry_count++;
@@ -1303,28 +1130,19 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
             transport_->params_->workers.max_retry_count) {
             LOG(WARNING) << "Slice " << slice
                          << " failed: retry count exceeded";
-            if (queue_already_drained) {
-                retireSweptSlice(worker, slice, poll_ts, nullptr);
-                updateSliceStatus(slice, FAILED);
-            } else {
-                ep->acknowledge(slice, FAILED, [&sweep](RdmaSlice* swept) {
-                    sweep.self->retireSweptSlice(*sweep.worker, swept,
-                                                 sweep.now_ns, nullptr);
-                });
-            }
-            handleEndpointError();
+            ep->acknowledge(slice, FAILED, [&sweep](RdmaSlice* swept) {
+                sweep.self->retireSweptSlice(*sweep.worker, swept, sweep.now_ns,
+                                             nullptr);
+            });
+            disableEndpoint(slice);
         } else {
             // Popped but still in flight: their work requests are
             // live and their completions are still coming, so only
             // the owning lane's count stops tracking them here.
-            if (queue_already_drained) {
-                discountFromOwner(worker, slice);
-            } else {
-                ep->acknowledge(slice, PENDING, [&](RdmaSlice* swept) {
-                    discountFromOwner(worker, swept);
-                });
-            }
-            handleEndpointError();
+            ep->acknowledge(slice, PENDING, [&](RdmaSlice* swept) {
+                discountFromOwner(worker, swept);
+            });
+            disableEndpoint(slice);
             if (slice->task->cancel_requested.load(std::memory_order_acquire)) {
                 updateSliceStatus(slice, CANCELED);
             } else {
@@ -1332,30 +1150,22 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
             }
         }
     } else {
-        if (queue_already_drained) {
-            retireSweptSlice(worker, slice, poll_ts, nullptr,
-                             /*bytes_moved=*/true);
-            updateSliceStatus(slice, COMPLETED);
-        } else {
-            ep->acknowledge(slice, COMPLETED, [&sweep](RdmaSlice* swept) {
-                sweep.self->retireSweptSlice(*sweep.worker, swept, sweep.now_ns,
-                                             nullptr,
-                                             /*bytes_moved=*/true);
-            });
-        }
+        ep->acknowledge(slice, COMPLETED, [&sweep](RdmaSlice* swept) {
+            sweep.self->retireSweptSlice(*sweep.worker, swept, sweep.now_ns,
+                                         nullptr, /*bytes_moved=*/true);
+        });
         // A successful GPU transfer re-admits any learned GDR
         // unreachability for the (GPU, NIC) pair(s) it used, so a
         // transient exclusion (or a recovered path) heals. Skipped
         // entirely until something has actually been excluded.
         if (GdrReachability::hasAnyExclusion()) {
             auto& gdr = GdrReachability::instance();
-            if (slice->source_gpu_ordinal >= 0 &&
-                !slice->source_nic_name.empty())
+            if (slice->source_gpu_ordinal >= 0 && slice->source_nic_name)
                 gdr.reportLocalSuccess(slice->source_nic_name,
                                        slice->source_gpu_ordinal);
-            if (slice->target_gpu_ordinal >= 0 &&
-                !slice->target_nic_name.empty())
-                gdr.reportRemoteSuccess(slice->target_machine_id,
+            if (slice->target_gpu_ordinal >= 0 && slice->target_nic_name &&
+                slice->target_machine_id)
+                gdr.reportRemoteSuccess(*slice->target_machine_id,
                                         slice->target_nic_name,
                                         slice->target_gpu_ordinal);
         }
@@ -1364,11 +1174,8 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
         // rail can be used again without waiting for the full
         // cooldown to expire. The monitor pointer is resolved once
         // in generatePostPath, so no map lookup is needed here.
-        const auto probe_token =
-            slice->rail_probe_token.exchange(0, std::memory_order_acq_rel);
-        if (auto rail = slice->rail_monitor; rail && rail->ready())
-            rail->markRecovered(slice->source_dev_id, slice->target_dev_id,
-                                probe_token);
+        if (auto* rail = slice->rail_monitor; rail && rail->ready())
+            rail->markRecovered(slice->source_dev_id, slice->target_dev_id);
         if (transport_->params_->workers.show_latency_info) {
             worker.perf.inflight_lat.add(inflight_lat);
             worker.perf.enqueue_lat.add(enqueue_lat);
@@ -1392,161 +1199,9 @@ void Workers::asyncPollCq() {
         int nr_poll = cq->poll(kPollCount, wc);
         if (nr_poll < 0) continue;
         auto poll_ts = getCurrentTimeInNano();
-<<<<<<< HEAD
-        thread_local std::vector<RdmaSlice*> completion_prefix;
-        if (completion_prefix.capacity() <
-            static_cast<size_t>(transport_->params_->endpoint.max_qp_wr))
-            completion_prefix.reserve(transport_->params_->endpoint.max_qp_wr);
-        for (int i = 0; i < nr_poll; ++i) {
-            const auto& raw = wc[i];
-            if (transport_->params_->endpoint.signal_interval <= 1) {
-                handleCompletion(worker, *context, raw, poll_ts,
-                                 i + 1 == nr_poll);
-                continue;
-            }
-
-            auto* tail = reinterpret_cast<RdmaSlice*>(raw.wr_id);
-            auto ep = tail ? tail->ep_weak_ptr.lock() : nullptr;
-            if (!ep || !ep->collectCompletionPrefix(tail, completion_prefix)) {
-                handleCompletion(worker, *context, raw, poll_ts,
-                                 i + 1 == nr_poll);
-                continue;
-            }
-            for (size_t index = 0; index < completion_prefix.size(); ++index) {
-                auto logical = raw;
-                logical.wr_id =
-                    reinterpret_cast<uint64_t>(completion_prefix[index]);
-                // A regular completion identifies its tail, so earlier WRs
-                // in its ordered SQ prefix completed successfully. A flush
-                // completion instead applies to every outstanding WR in the
-                // prefix because the QP entered ERR before they completed.
-                if (raw.status != IBV_WC_WR_FLUSH_ERR &&
-                    index + 1 != completion_prefix.size())
-                    logical.status = IBV_WC_SUCCESS;
-                handleCompletion(
-                    worker, *context, logical, poll_ts,
-                    i + 1 == nr_poll && index + 1 == completion_prefix.size(),
-                    true, true);
-            }
-        }
-=======
-<<<<<<< HEAD
         for (int i = 0; i < nr_poll; ++i)
             handleCompletion(worker, *context, wc[i], poll_ts,
                              i + 1 == nr_poll);
-=======
-        for (int i = 0; i < nr_poll; ++i) {
-            auto slice = (RdmaSlice*)wc[i].wr_id;
-            worker.inflight_slice_set.erase(slice);
-            auto ep = slice->ep_weak_ptr.lock();
-            double enqueue_lat =
-                (slice->submit_ts - slice->enqueue_ts) / 1000.0;
-            double inflight_lat = (poll_ts - slice->submit_ts) / 1000.0;
-            double overall_lat_sec = (poll_ts - slice->enqueue_ts) / 1e9;
-            releaseSliceQuota(slice, overall_lat_sec);
-            if (slice->word != PENDING) continue;
-            if (!ep) {
-                updateSliceStatus(slice, FAILED);
-                num_slices++;
-                continue;
-            }
-            if (wc[i].status != IBV_WC_SUCCESS) {
-                if (wc[i].status != IBV_WC_WR_FLUSH_ERR) {
-                    // TE handles them automatically
-                    LOG(INFO) << "Detected error WQE for slice " << slice
-                              << " (opcode: " << slice->task->request.opcode
-                              << ", source_addr: " << (void*)slice->source_addr
-                              << ", dest_addr: " << (void*)slice->target_addr
-                              << ", length: " << slice->length
-                              << ", local_nic: " << context->name()
-                              << "): " << ibv_wc_status_str(wc[i].status);
-                }
-                // GPUDirect reachability learning: a protection/access error
-                // on a GPU buffer means the chosen NIC cannot P2P-DMA to that
-                // GPU (ibv_reg_mr succeeded but the PCIe path is unusable).
-                // Record it so selection avoids that NIC and converges onto a
-                // reachable rail instead of exhausting retries. The local side
-                // (source NIC -> source GPU) surfaces as LOC_PROT; the remote
-                // side (target NIC -> target GPU) as REM_ACCESS or, for a
-                // remote GDR-read failure, REM_OP (observed on strict fabrics).
-                bool local_gdr_err = (wc[i].status == IBV_WC_LOC_PROT_ERR);
-                bool remote_gdr_err = (wc[i].status == IBV_WC_REM_ACCESS_ERR ||
-                                       wc[i].status == IBV_WC_REM_OP_ERR);
-                if (local_gdr_err && slice->source_gpu_ordinal >= 0 &&
-                    slice->source_nic_name) {
-                    GdrReachability::instance().reportLocalFailure(
-                        slice->source_nic_name, slice->source_gpu_ordinal);
-                } else if (remote_gdr_err && slice->target_gpu_ordinal >= 0 &&
-                           slice->target_nic_name && slice->target_machine_id) {
-                    GdrReachability::instance().reportRemoteFailure(
-                        *slice->target_machine_id, slice->target_nic_name,
-                        slice->target_gpu_ordinal);
-                }
-                slice->retry_count++;
-                if (slice->retry_count >=
-                    transport_->params_->workers.max_retry_count) {
-                    LOG(WARNING)
-                        << "Slice " << slice << " failed: retry count exceeded";
-                    num_slices += ep->acknowledge(slice, FAILED);
-                    disableEndpoint(slice);
-                } else {
-                    num_slices += ep->acknowledge(slice, PENDING);
-                    disableEndpoint(slice);
-                    if (slice->task->cancel_requested.load(
-                            std::memory_order_acquire)) {
-                        updateSliceStatus(slice, CANCELED);
-                    } else {
-<<<<<<< HEAD
-                        // Non-blocking re-enqueue: never wedge the worker on a
-                        // full queue. Fail the slice instead. See #3636/#3637.
-                        Status st = submit(slice);
-                        if (!st.ok()) {
-                            LOG(WARNING)
-                                << "Slice " << slice
-                                << " failed: re-enqueue rejected ("
-                                << st.message() << ")";
-                            updateSliceStatus(slice, FAILED);
-                        }
-=======
-                        submitFromTick(worker, slice);
->>>>>>> 56ed530a ([TENT] Keep the worker from blocking on its own submit queue (#3683))
-                    }
-                }
-            } else {
-                num_slices += ep->acknowledge(slice, COMPLETED);
-                // A successful GPU transfer re-admits any learned GDR
-                // unreachability for the (GPU, NIC) pair(s) it used, so a
-                // transient exclusion (or a recovered path) heals. Skipped
-                // entirely until something has actually been excluded.
-                if (GdrReachability::hasAnyExclusion()) {
-                    auto& gdr = GdrReachability::instance();
-                    if (slice->source_gpu_ordinal >= 0 &&
-                        slice->source_nic_name)
-                        gdr.reportLocalSuccess(slice->source_nic_name,
-                                               slice->source_gpu_ordinal);
-                    if (slice->target_gpu_ordinal >= 0 &&
-                        slice->target_nic_name && slice->target_machine_id)
-                        gdr.reportRemoteSuccess(*slice->target_machine_id,
-                                                slice->target_nic_name,
-                                                slice->target_gpu_ordinal);
-                }
-                // A successful transfer proves this rail is healthy; clear
-                // any accumulated error count so a previously-cooled-down
-                // rail can be used again without waiting for the full
-                // cooldown to expire. The monitor pointer is resolved once
-                // in generatePostPath, so no map lookup is needed here.
-                if (auto* rail = slice->rail_monitor; rail && rail->ready())
-                    rail->markRecovered(slice->source_dev_id,
-                                        slice->target_dev_id);
-                worker.perf.inflight_lat.add(inflight_lat);
-                worker.perf.enqueue_lat.add(enqueue_lat);
-            }
-        }
-    }
-    if (num_slices) {
-        worker.inflight_slices.fetch_sub(num_slices);
->>>>>>> d96993a ([Bugfix][TENT] Add non-blocking try_push to BoundedMPSCQueue and fail slices on queue full (#3636))
->>>>>>> 73060737 ([Bugfix][TENT] Add non-blocking try_push to BoundedMPSCQueue and fail slices on queue full (#3636))
     }
 }
 
@@ -1571,13 +1226,20 @@ void Workers::workerThread(int thread_id) {
     tl_wid = thread_id;
     auto& worker = worker_context_[thread_id];
 
+    auto has_queued_entries = [&worker]() {
+        for (const auto& queue : worker.queues) {
+            if (queue.has_ready()) return true;
+        }
+        return false;
+    };
+
     uint64_t grace_ts = 0;
     uint64_t last_perf_logging_ts = 0;
     while (running_) {
         auto current_ts = getCurrentTimeInNano();
         auto inflight_slices =
             worker.inflight_slices.load(std::memory_order_relaxed);
-        if (inflight_slices ||
+        if (inflight_slices || has_queued_entries() ||
             current_ts - grace_ts <
                 transport_->params_->workers.grace_period_ns) {
             asyncPostSend();
@@ -1593,8 +1255,10 @@ void Workers::workerThread(int thread_id) {
             std::unique_lock<std::mutex> lock(worker.mutex);
             worker.in_suspend = true;
             worker.cv.wait(lock, [&]() -> bool {
-                return !running_ || worker.inflight_slices.load(
-                                        std::memory_order_acquire) > 0;
+                return !running_ ||
+                       worker.inflight_slices.load(std::memory_order_acquire) >
+                           0 ||
+                       has_queued_entries();
             });
             worker.in_suspend = false;
         }
@@ -1636,10 +1300,7 @@ int Workers::handleContextEvents(int dev_id,
 
 void Workers::applyContextEvent(int dev_id, RdmaContext& context,
                                 const ibv_async_event& event) {
-    // Switched as an int, not as the enum: kIbvEventDeviceSpeedChange is not
-    // an enumerator on older headers, and the default below already covers
-    // every event this does not act on.
-    switch (static_cast<int>(event.event_type)) {
+    switch (event.event_type) {
         case IBV_EVENT_QP_FATAL:
         case IBV_EVENT_WQ_FATAL: {
             auto endpoint = (RdmaEndPoint*)event.element.qp->qp_context;
@@ -1696,14 +1357,15 @@ void Workers::applyContextEvent(int dev_id, RdmaContext& context,
             }
             break;
         }
-        case kIbvEventDeviceSpeedChange:
-            // A port speed changed without a link flap (e.g. a VF over LAG
-            // losing a PF). Device-level, so the event names no port; each
-            // context opens exactly one, so re-query that one. See
-            // kIbvEventDeviceSpeedChange for why this is not behind an
-            // #ifdef on the header's enumerator.
+#ifdef HAVE_IBV_EVENT_DEVICE_SPEED_CHANGE
+        case IBV_EVENT_DEVICE_SPEED_CHANGE:
+            // rdma-core >= 62: a port speed changed without a link flap
+            // (e.g. a VF over LAG losing a PF). Device-level, so the event
+            // names no port; each context opens exactly one, so re-query
+            // that one.
             refreshLinkSpeed(dev_id, context);
             break;
+#endif
         default:
             break;
     }
@@ -1819,8 +1481,6 @@ void Workers::monitorThread() {
 
         if (time_since_last_reclaim >= 1000) {  // 1 second = 1000 ms
             reclaimEndpoints();
-            // An endpoint destroyed above settles its orphans right here.
-            transport_->reapOrphanSlices(/*on_tick=*/true);
             // Safety net for a recovery event that never reached us.
             resumePausedContexts();
             last_reclaim_time = current_time;
@@ -1886,65 +1546,8 @@ Status Workers::getRouteHint(RouteHint& hint, SegmentID segment_id,
     auto mem_id = hint.topo->getMemId(location);
     if (mem_id < 0) mem_id = hint.topo->getMemId(kWildcardLocation);
     hint.topo_entry = hint.topo->getMemEntry(mem_id);
-    if (!hint.topo_entry)
-        return Status::DeviceNotFound(
-            "Unknown memory topology location" LOC_MARK);
     hint.location = std::move(location);
     return Status::OK();
-}
-
-uint64_t Workers::allocationDeviceMask(const RouteHint& source,
-                                       const RouteHint& target) {
-    const auto& machine = target.segment->machine_id;
-    const bool same_machine = source.segment->machine_id == machine;
-    {
-        std::shared_lock<std::shared_mutex> guard(allocation_rails_mutex_);
-        auto it = allocation_rails_.find(machine);
-        if (it != allocation_rails_.end() &&
-            it->second->local() == source.topo &&
-            it->second->remote() == target.topo)
-            return it->second->localDeviceMask(*target.topo_entry,
-                                               same_machine);
-    }
-    std::unique_lock<std::shared_mutex> guard(allocation_rails_mutex_);
-    auto& rail = getOrCreateRail(allocation_rails_, machine);
-    // No admission state or per-worker configuration is needed in this cache.
-    rail.load(std::shared_ptr<const Topology>(source.pin, source.topo),
-              std::shared_ptr<const Topology>(target.pin, target.topo),
-              rail_topo_json_);
-    return rail.localDeviceMask(*target.topo_entry, same_machine);
-}
-
-Status Workers::allocateDevices(const Request& request, uint32_t num_slices,
-                                uint64_t slice_bytes, uint64_t device_mask,
-                                std::vector<int>& slice_dev_ids) {
-    slice_dev_ids.clear();
-    RouteHint source, target;
-    CHECK_STATUS(getRouteHint(source, LOCAL_SEGMENT_ID,
-                              reinterpret_cast<uint64_t>(request.source),
-                              request.length));
-    CHECK_STATUS(getRouteHint(target, request.target_id, request.target_offset,
-                              request.length));
-    // A whole-request location is chosen by largest overlap. It cannot stand
-    // in for every slice when coalesced memory has different locations. Keep
-    // those requests on the per-slice path, before charging any allocation.
-    auto uniform_location = [&](const RouteHint& hint, uint64_t addr) {
-        uint64_t offset = hint.buffer->addr;
-        for (const auto& region : hint.buffer->regions) {
-            if (offset < addr + request.length && addr < offset + region.size &&
-                region.location != hint.location)
-                return false;
-            offset += region.size;
-        }
-        return true;
-    };
-    if (!uniform_location(source, reinterpret_cast<uint64_t>(request.source)) ||
-        !uniform_location(target, request.target_offset))
-        return Status::OK();
-    device_mask &= allocationDeviceMask(source, target);
-    return device_selector_->allocate(request.length, num_slices, slice_bytes,
-                                      source.topo_entry->name, slice_dev_ids,
-                                      request.priority, device_mask);
 }
 
 int Workers::getDeviceRank(const RouteHint& hint, int device_id) {
@@ -1959,24 +1562,10 @@ int Workers::getDeviceRank(const RouteHint& hint, int device_id) {
 Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
                                     RdmaSlice* slice) {
     auto& worker = worker_context_[tl_wid];
-    auto rail_monitor =
-        getOrCreateRail(worker.rails, target.segment->machine_id);
-    auto& rail = *rail_monitor;
-    if (!rail.ready() || source.topo != rail.local() ||
-        target.topo != rail.remote())
-        CHECK_STATUS(
-            rail.load(std::shared_ptr<const Topology>(source.pin, source.topo),
-                      std::shared_ptr<const Topology>(target.pin, target.topo),
-                      rail_topo_json_, transport_->conf_.get()));
     if (slice->source_dev_id < 0) {
-        const uint64_t device_mask =
-            slice->task->device_mask &
-            rail.localDeviceMask(
-                *target.topo_entry,
-                source.segment->machine_id == target.segment->machine_id);
         CHECK_STATUS(device_selector_->allocate(
-            slice->length, source.topo_entry->name, slice->source_dev_id,
-            slice->priority, device_mask));
+            slice->length, source.buffer->location, slice->source_dev_id,
+            slice->priority, slice->task->device_mask));
         slice->charged_dev = slice->source_dev_id;
     }
 
@@ -1984,31 +1573,16 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
         return Status::DeviceNotFound(
             "No device could access the slice memory region" LOC_MARK);
 
-    // Use the same-name direct rail and skip the memory-tier check. Without
-    // a same-name peer, keep the existing selection path.
-    bool affinity_pinned = false;
-    if (dest_device_affinity_) {
-        int direct = rail.directRemoteDevice(slice->source_dev_id);
-        if (direct >= 0) {
-            slice->target_dev_id = direct;
-            affinity_pinned = true;
-        } else if (!affinity_miss_warned_.exchange(true)) {
-            // The switch only pins a rail when both ends have a NIC with the
-            // same name. Say so once instead of silently falling back, which
-            // otherwise looks like the switch did nothing.
-            const auto* local_nic =
-                source.topo->getNicEntry(slice->source_dev_id);
-            LOG(WARNING) << "MC_ENABLE_DEST_DEVICE_AFFINITY is set, but peer "
-                         << target.segment->machine_id << " has no NIC named "
-                         << (local_nic ? local_nic->name : "<unknown>")
-                         << " that matches local NIC; keeping the normal "
-                            "selection path";
-        }
-    }
-    if (!affinity_pinned && slice->target_dev_id < 0) {
+    auto& rail = getOrCreateRail(worker.rails, target.segment->machine_id);
+    if (!rail.ready() || target.topo != rail.remote())
+        rail.load(std::shared_ptr<const Topology>(source.pin, source.topo),
+                  std::shared_ptr<const Topology>(target.pin, target.topo),
+                  rail_topo_json_, transport_->conf_.get());
+    if (slice->target_dev_id < 0) {
         int mapped_dev_id = rail.findBestRemoteDevice(
             slice->source_dev_id, target.topo_entry->numa_node);
-        for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
+        for (size_t rank = 0; rank < Topology::DevicePriorityRanks - 1;
+             ++rank) {
             if (rank && always_tier1_) break;
             const auto& list = target.topo_entry->device_list[rank];
             if (list.empty()) continue;
@@ -2067,38 +1641,22 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
     // Reactive learning in asyncPollCq still covers pairs not yet observed.
     bool gdr_excluded = false;
     if (GdrReachability::hasAnyExclusion()) {
+        int src_gpu = -1, dst_gpu = -1;
         LocationParser s(source.location), d(target.location);
-        const int src_gpu = gdrOrdinal(s);
-        const int dst_gpu = gdrOrdinal(d);
+        if (s.type() == "cuda") src_gpu = s.index();
+        if (d.type() == "cuda") dst_gpu = d.index();
         gdr_excluded = gdrPairExcluded(source, target, slice->source_dev_id,
                                        slice->target_dev_id, src_gpu, dst_gpu);
     }
 
-    uint64_t probe_token = 0;
     if (gdr_excluded ||
-        !rail.admit(slice->source_dev_id, slice->target_dev_id, probe_token)) {
-        VLOG(1) << "Optimal device pair not available: source_dev_id "
-                << slice->source_dev_id << ", target_dev_id "
-                << slice->target_dev_id;
-        LOG_EVERY_N(WARNING, 10000)
-            << "Optimal device pair not available: source_dev_id "
-            << slice->source_dev_id << ", target_dev_id "
-            << slice->target_dev_id;
-        // Stay on the pinned NIC instead of falling back to another rail.
-        if (affinity_pinned) {
-            return Status::DeviceNotFound(
-                "Same-name remote NIC is not available" LOC_MARK);
-        }
+        !rail.available(slice->source_dev_id, slice->target_dev_id)) {
+        LOG(INFO) << "Optimal device pair not available: source_dev_id "
+                  << slice->source_dev_id << ", target_dev_id "
+                  << slice->target_dev_id;
         return selectFallbackDevice(source, target, slice);
     }
 
-    // A retry released its charge before coming back here. allocate() does
-    // not run again when the local NIC is already chosen, so recharge the
-    // device this attempt will actually use. The first attempt already set
-    // charged_dev, and rechargeSlice is a no-op in that case.
-    rechargeSlice(slice, slice->source_dev_id);
-    slice->rail_monitor = std::move(rail_monitor);
-    slice->rail_probe_token = probe_token;
     return Status::OK();
 }
 
@@ -2138,11 +1696,7 @@ bool Workers::gdrPairExcluded(const RouteHint& source, const RouteHint& target,
 
 Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
                                      RdmaSlice* slice) {
-    // Mirrors selectOptimalDevice: a rare WARNING sample so a sustained
-    // fallback storm is visible without flooding; VLOG(1) for debugging.
-    VLOG(1) << "fallback device selection for slice " << slice;
-    LOG_EVERY_N(WARNING, 10000)
-        << "fallback device selection for slice " << slice;
+    LOG_EVERY_N(INFO, 100) << "fallback device selection for slice " << slice;
     bool same_machine =
         (source.segment->machine_id == target.segment->machine_id);
 
@@ -2151,8 +1705,8 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
     int src_gpu = -1, dst_gpu = -1;
     if (gdr_learned) {
         LocationParser s(source.location), d(target.location);
-        src_gpu = gdrOrdinal(s);
-        dst_gpu = gdrOrdinal(d);
+        if (s.type() == "cuda") src_gpu = s.index();
+        if (d.type() == "cuda") dst_gpu = d.index();
     }
 
     size_t src_total = 0;
@@ -2178,16 +1732,10 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
     // pair. Rail-down and GDR-excluded pairs are skipped, so the scan converges
     // onto a reachable rail instead of exhausting retries.
     auto& worker = worker_context_[tl_wid];
-    auto rail_mon = same_machine ? std::shared_ptr<RailMonitor>{}
-                                 : getOrCreateRail(worker.rails,
-                                                   target.segment->machine_id);
-    if (rail_mon && (!rail_mon->ready() || source.topo != rail_mon->local() ||
-                     target.topo != rail_mon->remote())) {
-        CHECK_STATUS(rail_mon->load(
-            std::shared_ptr<const Topology>(source.pin, source.topo),
-            std::shared_ptr<const Topology>(target.pin, target.topo),
-            rail_topo_json_, transport_->conf_.get()));
-    }
+    RailMonitor* rail_mon =
+        same_machine
+            ? nullptr
+            : &getOrCreateRail(worker.rails, target.segment->machine_id);
     size_t start =
         static_cast<size_t>(slice->last_fallback_idx + 1) % total_combos;
     const uint64_t device_mask = slice->task->device_mask;
@@ -2202,17 +1750,13 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
         if (strictLocalNuma() &&
             source.topo->isCrossNuma(*source.topo_entry, sdev))
             continue;
+        bool reachable = same_machine ? (sdev == tdev)  // loopback is safe
+                                      : rail_mon->available(sdev, tdev);
+
         // Skip NICs that cannot GPUDirect-DMA to the source/target GPU.
-        // Checked BEFORE admit() so a probe/trial is never armed on a rail
-        // that GDR will reject -- arming then discarding would orphan the
-        // in-flight flag and strand the rail.
-        if (!same_machine && gdr_learned &&
+        if (reachable && gdr_learned &&
             gdrPairExcluded(source, target, sdev, tdev, src_gpu, dst_gpu))
-            continue;
-        uint64_t probe_token = 0;
-        bool reachable = same_machine
-                             ? (sdev == tdev)  // loopback is safe
-                             : rail_mon->admit(sdev, tdev, probe_token);
+            reachable = false;
 
         if (reachable) {
             // A retry gets here after the failure path returned the slice's
@@ -2222,8 +1766,6 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
             rechargeSlice(slice, sdev);
             slice->source_dev_id = sdev;
             slice->target_dev_id = tdev;
-            slice->rail_monitor = rail_mon;
-            slice->rail_probe_token = probe_token;
             // Keys are assigned by generatePostPath() once the device pair is
             // settled.
             slice->last_fallback_idx = static_cast<int>(idx);
@@ -2235,10 +1777,6 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
 }
 
 Status Workers::generatePostPath(RdmaSlice* slice) {
-    // Retries acquire a fresh admission. Do not carry an earlier attempt's
-    // ownership token across route resolution or fallback selection.
-    slice->rail_monitor.reset();
-    slice->rail_probe_token = 0;
     RouteHint source, target;
     CHECK_STATUS(getRouteHint(source, LOCAL_SEGMENT_ID,
                               (uint64_t)slice->source_addr, slice->length));
@@ -2247,35 +1785,10 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
     CHECK_STATUS(getRouteHint(target, target_id, (uint64_t)slice->target_addr,
                               slice->length));
 
-    // Stay on the optimal path for a retry only when this local NIC is
-    // actually pinned to a same-name peer. The affinity switch alone must
-    // not stop the original rotation.
-    bool same_name_pinned = false;
-    if (slice->retry_count != 0 && dest_device_affinity_ &&
-        slice->source_dev_id >= 0 && target.segment) {
-        auto& worker = worker_context_[tl_wid];
-        auto rail = getOrCreateRail(worker.rails, target.segment->machine_id);
-        if (!rail->ready() || source.topo != rail->local() ||
-            target.topo != rail->remote()) {
-            CHECK_STATUS(rail->load(
-                std::shared_ptr<const Topology>(source.pin, source.topo),
-                std::shared_ptr<const Topology>(target.pin, target.topo),
-                rail_topo_json_, transport_->conf_.get()));
-        }
-        same_name_pinned = rail->directRemoteDevice(slice->source_dev_id) >= 0;
-    }
-    if (slice->retry_count == 0 || same_name_pinned)
+    if (slice->retry_count == 0)
         CHECK_STATUS(selectOptimalDevice(source, target, slice));
     else
         CHECK_STATUS(selectFallbackDevice(source, target, slice));
-    // Cache the RailMonitor pointer as soon as select* succeeds, BEFORE the
-    // rkey bounds check below: select* may have armed a probe/trial via
-    // admit(), and any later failure (rkey out of bounds, a pre-wire cancel)
-    // must be able to cancel only this slice's token. Assigning this after the
-    // check left rail_monitor null on the OOB path, stranding a Half-Open
-    // trial.
-    slice->rail_monitor = getOrCreateRail(worker_context_[tl_wid].rails,
-                                          target.segment->machine_id);
     // Keys are NicID-indexed. A peer running an older build publishes a
     // compacted rkey vector, so a NicID from its device_list can point past the
     // end; fail the slice instead of reading out of bounds.
@@ -2289,18 +1802,23 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
             "Selected device has no registered memory key" LOC_MARK);
     slice->source_lkey = lkeys[slice->source_dev_id];
     slice->target_rkey = rkeys[slice->target_dev_id];
-    // Copy identifiers for GPUDirect reachability learning in asyncPollCq.
-    // RouteHint pins the metadata snapshot only through this call; completion
-    // handling may happen after the segment publishes a replacement snapshot.
+    // Cache the RailMonitor pointer so asyncPollCq / disableEndpoint can
+    // update rail state without a segment lookup or string-keyed map
+    // lookup on the hot path.
+    slice->rail_monitor = &getOrCreateRail(worker_context_[tl_wid].rails,
+                                           target.segment->machine_id);
+    // Stash identifiers for GPUDirect reachability learning in asyncPollCq.
+    // The name pointers alias stable Topology::NicEntry / segment storage and
+    // remain valid for the slice's lifetime.
     {
         LocationParser s(source.location), d(target.location);
-        slice->source_gpu_ordinal = gdrOrdinal(s);
-        slice->target_gpu_ordinal = gdrOrdinal(d);
+        slice->source_gpu_ordinal = (s.type() == "cuda") ? s.index() : -1;
+        slice->target_gpu_ordinal = (d.type() == "cuda") ? d.index() : -1;
         const auto* lnic = source.topo->getNicEntry(slice->source_dev_id);
         const auto* rnic = target.topo->getNicEntry(slice->target_dev_id);
-        slice->source_nic_name = lnic ? lnic->name : "";
-        slice->target_nic_name = rnic ? rnic->name : "";
-        slice->target_machine_id = target.segment->machine_id;
+        slice->source_nic_name = lnic ? lnic->name.c_str() : nullptr;
+        slice->target_nic_name = rnic ? rnic->name.c_str() : nullptr;
+        slice->target_machine_id = &target.segment->machine_id;
     }
     if (transport_->params_->log_slice_affinity) {
         const auto* local_nic = source.topo->getNicEntry(slice->source_dev_id);
