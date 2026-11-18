@@ -43,38 +43,6 @@ struct BoundedMPSCQueue {
 
     ~BoundedMPSCQueue() = default;
 
-    bool try_push(T &slice_list) {
-        if (slice_list.num_slices == 0) return true;
-        uint64_t pos = tail.load(std::memory_order_relaxed);
-        Cell *cell = &buffer[pos % Capacity];
-
-        uint64_t seq = cell->sequence.load(std::memory_order_acquire);
-        intptr_t dif =
-            static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
-        if (dif == 0) {
-            if (tail.compare_exchange_weak(pos, pos + 1,
-                                           std::memory_order_acq_rel,
-                                           std::memory_order_relaxed)) {
-                cell->data = slice_list;
-                cell->sequence.store(pos + 1, std::memory_order_release);
-                return true;
-            }
-        }
-        return false;
-    }
-
-    void push(T &slice_list) {
-        while (!try_push(slice_list)) {
-            std::this_thread::yield();
-        }
-    }
-
-    void push(T &slice_list) {
-        while (!try_push(slice_list)) {
-            std::this_thread::yield();
-        }
-    }
-
     // Non-blocking push: returns false when the queue is full. The worker
     // thread re-enqueues through this so a full queue parks the entry in a
     // local overflow instead of wedging the only consumer (issue #3637).
@@ -93,6 +61,12 @@ struct BoundedMPSCQueue {
         cell->data = slice_list;
         cell->sequence.store(pos + 1, std::memory_order_release);
         return true;
+    }
+
+    void push(T &slice_list) {
+        while (!try_push(slice_list)) {
+            std::this_thread::yield();
+        }
     }
 
     // Non-blocking push: returns false when the queue is full. The worker
